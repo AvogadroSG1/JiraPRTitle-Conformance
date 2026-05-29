@@ -12,9 +12,11 @@ from rich.panel import Panel
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
-from analyze_jira import AnalyzeConfig, AnalyzeResult, run_analysis
+from rich.prompt import Prompt
+
+from analyze_jira import AnalyzeConfig, AnalyzeResult, analyze_contributor, collect_contributors, run_analysis
 from fetch_prs import FetchConfig, FetchResult, run_fetch
-from report import ReportConfig, ReportResult, run_report
+from report import ReportConfig, ReportResult, run_contributor_report, run_report
 
 console = Console()
 
@@ -55,6 +57,10 @@ Examples:
     parser.add_argument("--continue-on-error", action="store_true", help="Don't abort if a stage fails")
     parser.add_argument("--verbose", "-v", action="store_true")
 
+    contributor_group = parser.add_mutually_exclusive_group()
+    contributor_group.add_argument("--username", help="Analyse a specific contributor (non-interactive)")
+    contributor_group.add_argument("--contributor", action="store_true", help="Pick a contributor interactively")
+
     return parser.parse_args()
 
 
@@ -75,6 +81,121 @@ def format_duration(seconds: float) -> str:
     minutes = int(seconds // 60)
     secs = seconds % 60
     return f"{minutes}m {secs:.0f}s"
+
+
+def resolve_contributor(args: argparse.Namespace, raw_dir: Path) -> str:
+    """Return the chosen contributor username, prompting interactively if needed."""
+    if args.username:
+        return args.username
+
+    contributors = collect_contributors(raw_dir)
+    if not contributors:
+        console.print("[red]No contributors found in fetched data.[/red]")
+        sys.exit(1)
+
+    console.print(f"\n[bold]Contributors found ([cyan]{len(contributors)}[/cyan]):[/bold]\n")
+    for i, name in enumerate(contributors, 1):
+        console.print(f"  [dim]{i:>4}.[/dim] {name}")
+
+    console.print()
+    choice = Prompt.ask("Enter number or username")
+    choice = choice.strip()
+
+    if choice.isdigit():
+        idx = int(choice) - 1
+        if 0 <= idx < len(contributors):
+            return contributors[idx]
+        console.print(f"[red]Number {choice} out of range (1–{len(contributors)}).[/red]")
+        sys.exit(1)
+
+    if choice in contributors:
+        return choice
+
+    # Accept case-insensitive match
+    lower_map = {c.lower(): c for c in contributors}
+    if choice.lower() in lower_map:
+        return lower_map[choice.lower()]
+
+    console.print(f"[red]Username '[bold]{choice}[/bold]' not found in contributor list.[/red]")
+    sys.exit(1)
+
+
+def run_contributor_pipeline(args: argparse.Namespace) -> None:
+    """Run the contributor-scoped analysis and report pipeline."""
+    raw_dir = BASE_DIR / "data" / "raw"
+    output_dir = BASE_DIR / "output"
+    overall_start = time.time()
+
+    stages = resolve_stages(args)
+
+    console.print(
+        Panel.fit(
+            "[bold blue]Jira Compliance Scanner — Contributor Mode[/bold blue]\n"
+            f"Org: [cyan]{args.org}[/cyan] | Since: [cyan]{args.since}[/cyan]",
+            border_style="blue",
+        )
+    )
+    console.print()
+
+    if "fetch" in stages:
+        fetch_config = FetchConfig(
+            org=args.org,
+            repos=args.repos,
+            exclude_repos=args.exclude_repos or [],
+            since=args.since,
+            until=args.until,
+            output_dir=raw_dir,
+            max_repos=args.max_repos,
+            verbose=args.verbose,
+        )
+        progress = Progress(
+            SpinnerColumn(), TextColumn("[bold]{task.description}[/bold]"),
+            BarColumn(bar_width=40), MofNCompleteColumn(),
+            TextColumn("[dim]{task.fields[status]}[/dim]"), TimeElapsedColumn(),
+            console=console,
+        )
+        with progress:
+            tid = progress.add_task("  Fetch   ", total=None, status="discovering repos...")
+            try:
+                result = run_fetch(fetch_config, on_progress=lambda c, t, l: progress.update(tid, completed=c, total=t, status=l))
+                progress.update(tid, completed=1, total=1,
+                    status=f"[green]✓ {result.repos_fetched} repos · {result.total_prs:,} PRs[/green]")
+            except Exception as e:
+                progress.update(tid, completed=1, total=1, status=f"[red]✗ {e}[/red]")
+                if not args.continue_on_error:
+                    console.print(f"\n[red bold]Fetch failed:[/red bold] {e}")
+                    sys.exit(1)
+
+    username = resolve_contributor(args, raw_dir)
+    console.print(f"\nAnalysing contributor: [bold cyan]{username}[/bold cyan]\n")
+
+    contributor_result = analyze_contributor(username, raw_dir, since=args.since, until=args.until)
+
+    if contributor_result.total_prs == 0:
+        console.print(f"[yellow]No PRs found for '[bold]{username}[/bold]' in the fetched data.[/yellow]")
+        sys.exit(0)
+
+    report_result = run_contributor_report(contributor_result, output_dir, fmt=args.format)
+
+    total_elapsed = time.time() - overall_start
+
+    summary = Table(title=f"Contributor: {username}", show_header=True, header_style="bold")
+    summary.add_column("Metric")
+    summary.add_column("Value")
+    summary.add_row("Total PRs", f"{contributor_result.total_prs:,}")
+    summary.add_row("With Jira", f"{contributor_result.with_jira:,}")
+    summary.add_row("Without Jira", f"{contributor_result.total_prs - contributor_result.with_jira:,}")
+    summary.add_row("Compliance Rate", f"{contributor_result.compliance_rate * 100:.1f}%")
+    summary.add_row("Repos contributed to", str(len(contributor_result.per_repo)))
+    summary.add_row("Analysis time", format_duration(contributor_result.elapsed))
+    summary.add_section()
+    summary.add_row("[bold]Total[/bold]", f"[bold]{format_duration(total_elapsed)}[/bold]")
+    console.print(summary)
+
+    if report_result.output_files:
+        console.print("\n[green]Reports written:[/green]")
+        for p in report_result.output_files:
+            console.print(f"  {p}")
 
 
 def run_pipeline(args: argparse.Namespace) -> None:
@@ -248,7 +369,10 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
 def main():
     args = parse_args()
-    run_pipeline(args)
+    if args.username or args.contributor:
+        run_contributor_pipeline(args)
+    else:
+        run_pipeline(args)
 
 
 if __name__ == "__main__":

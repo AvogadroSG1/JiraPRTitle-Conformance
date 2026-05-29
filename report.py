@@ -295,6 +295,122 @@ def run_report(
     return result
 
 
+def run_contributor_report(
+    result,  # ContributorResult
+    output_dir: Path,
+    fmt: str = "both",
+    on_progress: Callable[[int, int, str], None] | None = None,
+) -> "ReportResult":
+    """Generate a per-contributor compliance report from a ContributorResult."""
+    import time
+
+    start = time.time()
+    report_result = ReportResult()
+
+    username = result.username
+    rate_pct = f"{result.compliance_rate * 100:.1f}%"
+    without_jira = result.total_prs - result.with_jira
+
+    lines = [
+        f"# Contributor Report: {username}\n",
+        "## Summary\n",
+        f"| Metric | Value |",
+        f"|--------|-------|",
+        f"| Total PRs | {result.total_prs:,} |",
+        f"| With Jira | {result.with_jira:,} |",
+        f"| Without Jira | {without_jira:,} |",
+        f"| Compliance Rate | {rate_pct} |",
+    ]
+
+    if on_progress:
+        on_progress(1, 5, "summary")
+
+    if result.per_repo:
+        lines += [
+            "",
+            "## Per-Repo Breakdown\n",
+            "| Repo | PRs | With Jira | Compliance |",
+            "|------|-----|-----------|------------|",
+        ]
+        for r in result.per_repo:
+            lines.append(f"| {r['repo']} | {r['total']:,} | {r['with_jira']:,} | {r['rate']*100:.1f}% |")
+
+    if on_progress:
+        on_progress(2, 5, "per-repo")
+
+    if result.quarterly_trend:
+        lines += [
+            "",
+            "## Quarterly Trend\n",
+            "| Quarter | PRs | With Jira | Compliance |",
+            "|---------|-----|-----------|------------|",
+        ]
+        for q, data in result.quarterly_trend.items():
+            lines.append(f"| {q} | {data['total']:,} | {data['with_jira']:,} | {data['rate']*100:.1f}% |")
+
+    if on_progress:
+        on_progress(3, 5, "quarterly-trend")
+
+    if result.category_breakdown:
+        total_no_jira = sum(result.category_breakdown.values())
+        lines += [
+            "",
+            "## No-Jira PR Categories\n",
+            "| Category | Count | % of No-Jira |",
+            "|----------|-------|--------------|",
+        ]
+        for cat, count in result.category_breakdown.items():
+            pct = count / total_no_jira * 100 if total_no_jira > 0 else 0
+            lines.append(f"| {cat} | {count:,} | {pct:.1f}% |")
+
+    if on_progress:
+        on_progress(4, 5, "categories")
+
+    if result.top_jira_projects:
+        lines += [
+            "",
+            "## Top Jira Projects\n",
+            "| Project | References |",
+            "|---------|-----------|",
+        ]
+        for proj, count in result.top_jira_projects:
+            lines.append(f"| {proj} | {count:,} |")
+
+    if on_progress:
+        on_progress(5, 5, "jira-projects")
+
+    report_md = "\n".join(lines)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if fmt in ("markdown", "both"):
+        md_path = output_dir / f"contributor_{username}.md"
+        with open(md_path, "w") as f:
+            f.write(report_md)
+        report_result.output_files.append(md_path)
+
+    if fmt in ("json", "both"):
+        json_path = output_dir / f"contributor_{username}.json"
+        payload = {
+            "username": username,
+            "total_prs": result.total_prs,
+            "with_jira": result.with_jira,
+            "without_jira": without_jira,
+            "compliance_rate": result.compliance_rate,
+            "per_repo": result.per_repo,
+            "category_breakdown": result.category_breakdown,
+            "quarterly_trend": result.quarterly_trend,
+            "top_jira_projects": [
+                {"project": p, "count": c} for p, c in result.top_jira_projects
+            ],
+        }
+        with open(json_path, "w") as f:
+            json.dump(payload, f, indent=2)
+        report_result.output_files.append(json_path)
+
+    report_result.elapsed = time.time() - start
+    return report_result
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate Jira compliance report")
     parser.add_argument(

@@ -197,6 +197,131 @@ def aggregate_results(repo_results: list[dict]) -> dict:
 
 
 @dataclass
+class ContributorResult:
+    username: str = ""
+    total_prs: int = 0
+    with_jira: int = 0
+    compliance_rate: float = 0.0
+    per_repo: list[dict] = field(default_factory=list)
+    category_breakdown: dict = field(default_factory=dict)
+    quarterly_trend: dict = field(default_factory=dict)
+    top_jira_projects: list[tuple] = field(default_factory=list)
+    elapsed: float = 0.0
+    errors: list[str] = field(default_factory=list)
+
+
+def collect_contributors(raw_dir: Path, bot_authors: frozenset | None = None) -> list[str]:
+    """Return sorted unique human contributor usernames from all raw JSONL files."""
+    from classifiers import BOT_AUTHORS as _DEFAULT_BOTS
+    bots = bot_authors if bot_authors is not None else _DEFAULT_BOTS
+    seen: set[str] = set()
+    for jsonl_file in sorted(raw_dir.glob("*.jsonl")):
+        with open(jsonl_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    pr = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                author = pr.get("author", "")
+                if author and author.lower() not in bots:
+                    seen.add(author)
+    return sorted(seen, key=str.lower)
+
+
+def analyze_contributor(username: str, raw_dir: Path, since: str | None = None, until: str | None = None) -> ContributorResult:
+    """Analyze all PRs for a single contributor across all repos."""
+    import time
+    from classifiers import detect_jira_tickets, extract_jira_projects, classify_no_jira_pr
+
+    start = time.time()
+    result = ContributorResult(username=username)
+
+    since_dt = datetime.fromisoformat(since).replace(tzinfo=timezone.utc) if since else None
+    until_dt = datetime.fromisoformat(until).replace(tzinfo=timezone.utc) if until else None
+
+    per_repo: dict[str, dict] = {}
+    category_counter: Counter = Counter()
+    jira_project_counter: Counter = Counter()
+    quarters: dict[str, dict] = {}
+
+    for jsonl_file in sorted(raw_dir.glob("*.jsonl")):
+        repo_name = jsonl_file.stem
+        with open(jsonl_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    pr = json.loads(line)
+                except json.JSONDecodeError:
+                    result.errors.append(f"Malformed line in {jsonl_file.name}")
+                    continue
+
+                if pr.get("author", "") != username:
+                    continue
+
+                merged_at = pr.get("mergedAt", "")
+                if merged_at:
+                    try:
+                        merged_dt = datetime.fromisoformat(merged_at.replace("Z", "+00:00"))
+                        if since_dt and merged_dt < since_dt:
+                            continue
+                        if until_dt and merged_dt > until_dt:
+                            continue
+                    except ValueError:
+                        pass
+
+                if repo_name not in per_repo:
+                    per_repo[repo_name] = {"total": 0, "with_jira": 0}
+                per_repo[repo_name]["total"] += 1
+                result.total_prs += 1
+
+                tickets = detect_jira_tickets(pr.get("title", ""), pr.get("body", ""))
+                if tickets:
+                    result.with_jira += 1
+                    per_repo[repo_name]["with_jira"] += 1
+                    for project in extract_jira_projects(tickets):
+                        jira_project_counter[project] += 1
+                else:
+                    category = classify_no_jira_pr(pr)
+                    category_counter[category] += 1
+
+                if merged_at:
+                    try:
+                        q = quarter_from_date(merged_at)
+                        if q not in quarters:
+                            quarters[q] = {"total": 0, "with_jira": 0}
+                        quarters[q]["total"] += 1
+                        if tickets:
+                            quarters[q]["with_jira"] += 1
+                    except (ValueError, KeyError):
+                        pass
+
+    result.compliance_rate = result.with_jira / result.total_prs if result.total_prs > 0 else 0.0
+    result.per_repo = [
+        {
+            "repo": repo,
+            "total": stats["total"],
+            "with_jira": stats["with_jira"],
+            "rate": stats["with_jira"] / stats["total"] if stats["total"] > 0 else 0.0,
+        }
+        for repo, stats in sorted(per_repo.items(), key=lambda x: -x[1]["total"])
+    ]
+    result.category_breakdown = dict(category_counter.most_common())
+    result.top_jira_projects = jira_project_counter.most_common(10)
+
+    for q_data in quarters.values():
+        q_data["rate"] = q_data["with_jira"] / q_data["total"] if q_data["total"] > 0 else 0.0
+    result.quarterly_trend = dict(sorted(quarters.items()))
+
+    result.elapsed = time.time() - start
+    return result
+
+
+@dataclass
 class AnalyzeConfig:
     input_dir: Path = field(default_factory=lambda: Path(__file__).parent / "data" / "raw")
     output: Path = field(default_factory=lambda: Path(__file__).parent / "data" / "analysis.json")
