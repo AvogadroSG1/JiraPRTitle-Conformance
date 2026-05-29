@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""Analyze fetched PR data for Jira ticket compliance."""
+
+import argparse
+import json
+import logging
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+
+from classifiers import (
+    classify_no_jira_pr,
+    detect_jira_tickets,
+    extract_jira_projects,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def quarter_from_date(dt_str: str) -> str:
+    dt = datetime.fromisoformat(dt_str.replace('Z', '+00:00'))
+    q = (dt.month - 1) // 3 + 1
+    return f"{dt.year}-Q{q}"
+
+
+def analyze_repo(repo_file: Path, since: str | None, until: str | None) -> dict:
+    """Analyze a single repo's JSONL file."""
+    from classifiers import BOT_AUTHORS
+
+    since_dt = datetime.fromisoformat(since).replace(tzinfo=timezone.utc) if since else None
+    until_dt = datetime.fromisoformat(until).replace(tzinfo=timezone.utc) if until else None
+
+    prs = []
+    with open(repo_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                prs.append(json.loads(line))
+            except json.JSONDecodeError:
+                logger.warning("Skipping malformed line in %s", repo_file.name)
+
+    if since_dt or until_dt:
+        filtered = []
+        for pr in prs:
+            merged_at = datetime.fromisoformat(pr['mergedAt'].replace('Z', '+00:00'))
+            if since_dt and merged_at < since_dt:
+                continue
+            if until_dt and merged_at > until_dt:
+                continue
+            filtered.append(pr)
+        prs = filtered
+
+    repo_name = repo_file.stem
+    total = len(prs)
+    with_jira = []
+    without_jira = []
+    jira_projects = Counter()
+    categories = Counter()
+    bot_count = 0
+
+    for pr in prs:
+        if pr.get('author', '').lower() in BOT_AUTHORS:
+            bot_count += 1
+
+        tickets = detect_jira_tickets(pr.get('title', ''), pr.get('body', ''))
+        if tickets:
+            pr['jira_keys'] = tickets
+            with_jira.append(pr)
+            for project in extract_jira_projects(tickets):
+                jira_projects[project] += 1
+        else:
+            pr['jira_keys'] = []
+            category = classify_no_jira_pr(pr)
+            pr['category'] = category
+            categories[category] += 1
+            without_jira.append(pr)
+
+    compliance_rate = len(with_jira) / total if total > 0 else 0.0
+    non_bot_total = total - bot_count
+    non_bot_with_jira = sum(
+        1 for pr in with_jira if pr.get('author', '').lower() not in BOT_AUTHORS
+    )
+    compliance_rate_excl_bots = non_bot_with_jira / non_bot_total if non_bot_total > 0 else 0.0
+
+    dates = [pr['mergedAt'] for pr in prs if pr.get('mergedAt')]
+    date_range = {
+        'earliest': min(dates) if dates else None,
+        'latest': max(dates) if dates else None,
+    }
+
+    return {
+        'repo': repo_name,
+        'total_prs': total,
+        'with_jira': len(with_jira),
+        'without_jira': len(without_jira),
+        'compliance_rate': compliance_rate,
+        'compliance_rate_excl_bots': compliance_rate_excl_bots,
+        'jira_projects': dict(jira_projects.most_common()),
+        'categories': dict(categories.most_common()),
+        'bot_prs': bot_count,
+        'date_range': date_range,
+        'no_jira_prs': without_jira,
+    }
+
+
+def compute_quarterly_trends(repo_results: list[dict]) -> dict:
+    """Group all PRs by quarter and compute compliance rate per quarter."""
+    quarters: dict[str, dict] = {}
+
+    for result in repo_results:
+        all_prs_file = Path(result.get('_source_file', ''))
+        if not all_prs_file.exists():
+            continue
+
+        with open(all_prs_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                pr = json.loads(line)
+                q = quarter_from_date(pr['mergedAt'])
+                if q not in quarters:
+                    quarters[q] = {'total': 0, 'with_jira': 0}
+                quarters[q]['total'] += 1
+                tickets = detect_jira_tickets(pr.get('title', ''), pr.get('body', ''))
+                if tickets:
+                    quarters[q]['with_jira'] += 1
+
+    for q_data in quarters.values():
+        q_data['rate'] = q_data['with_jira'] / q_data['total'] if q_data['total'] > 0 else 0.0
+
+    return dict(sorted(quarters.items()))
+
+
+def aggregate_results(repo_results: list[dict]) -> dict:
+    """Combine per-repo results into org-wide statistics."""
+    total_prs = sum(r['total_prs'] for r in repo_results)
+    total_with_jira = sum(r['with_jira'] for r in repo_results)
+    total_without_jira = sum(r['without_jira'] for r in repo_results)
+    total_bot_prs = sum(r['bot_prs'] for r in repo_results)
+
+    org_jira_projects = Counter()
+    org_categories = Counter()
+    for r in repo_results:
+        for proj, count in r['jira_projects'].items():
+            org_jira_projects[proj] += count
+        for cat, count in r['categories'].items():
+            org_categories[cat] += count
+
+    non_bot_total = total_prs - total_bot_prs
+    non_bot_with_jira = total_with_jira - sum(
+        r['bot_prs'] - sum(
+            1 for pr in r['no_jira_prs'] if pr.get('author', '').lower() in {
+                'dependabot', 'dependabot[bot]', 'renovate', 'renovate[bot]',
+                'github-actions', 'github-actions[bot]', 'so-tooling',
+            }
+        )
+        for r in repo_results
+    )
+    compliance_excl_bots = non_bot_with_jira / non_bot_total if non_bot_total > 0 else 0.0
+
+    per_repo_summary = []
+    for r in repo_results:
+        if r['total_prs'] == 0:
+            continue
+        per_repo_summary.append({
+            'repo': r['repo'],
+            'total_prs': r['total_prs'],
+            'with_jira': r['with_jira'],
+            'compliance_rate': r['compliance_rate'],
+            'compliance_rate_excl_bots': r['compliance_rate_excl_bots'],
+            'top_jira_projects': list(r['jira_projects'].keys())[:5],
+            'date_range': r['date_range'],
+        })
+
+    per_repo_summary.sort(key=lambda x: x['total_prs'], reverse=True)
+
+    return {
+        'org_summary': {
+            'total_repos': len(repo_results),
+            'repos_with_prs': sum(1 for r in repo_results if r['total_prs'] > 0),
+            'total_prs': total_prs,
+            'with_jira': total_with_jira,
+            'without_jira': total_without_jira,
+            'compliance_rate': total_with_jira / total_prs if total_prs > 0 else 0.0,
+            'compliance_rate_excl_bots': compliance_excl_bots,
+            'bot_prs': total_bot_prs,
+        },
+        'jira_projects': dict(org_jira_projects.most_common()),
+        'category_breakdown': dict(org_categories.most_common()),
+        'per_repo': per_repo_summary,
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Analyze PRs for Jira ticket compliance")
+    parser.add_argument(
+        '--input-dir', type=Path, default=Path(__file__).parent / 'data' / 'raw',
+        help="Directory containing per-repo JSONL files",
+    )
+    parser.add_argument(
+        '--output', type=Path, default=Path(__file__).parent / 'data' / 'analysis.json',
+        help="Output analysis JSON file",
+    )
+    parser.add_argument('--since', default=None, help="Only analyze PRs merged after this date")
+    parser.add_argument('--until', default=None, help="Only analyze PRs merged before this date")
+    parser.add_argument('--repos', nargs='*', help="Specific repos to analyze (default: all)")
+    parser.add_argument(
+        '--no-exclude-bots', dest='exclude_bots', action='store_false',
+        help="Include bot PRs in compliance rate",
+    )
+    parser.add_argument(
+        '--save-no-jira', type=Path, default=Path(__file__).parent / 'data' / 'no_jira.json',
+        help="Save classified no-Jira PRs",
+    )
+    parser.add_argument('--verbose', '-v', action='store_true')
+    parser.set_defaults(exclude_bots=True)
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format='%(asctime)s %(levelname)s %(message)s',
+        datefmt='%H:%M:%S',
+    )
+
+    jsonl_files = sorted(args.input_dir.glob('*.jsonl'))
+    if args.repos:
+        repo_set = {r.lower() for r in args.repos}
+        jsonl_files = [f for f in jsonl_files if f.stem.lower() in repo_set]
+
+    if not jsonl_files:
+        logger.error("No JSONL files found in %s", args.input_dir)
+        return
+
+    logger.info("Analyzing %d repo files...", len(jsonl_files))
+    repo_results = []
+
+    for repo_file in jsonl_files:
+        result = analyze_repo(repo_file, args.since, args.until)
+        result['_source_file'] = str(repo_file)
+        repo_results.append(result)
+        logger.info("  %s: %d PRs, %.1f%% compliance",
+                    result['repo'], result['total_prs'], result['compliance_rate'] * 100)
+
+    quarterly_trends = compute_quarterly_trends(repo_results)
+    aggregate = aggregate_results(repo_results)
+    aggregate['quarterly_trends'] = quarterly_trends
+    aggregate['generated_at'] = datetime.now(timezone.utc).isoformat()
+    aggregate['config'] = {
+        'since': args.since,
+        'until': args.until,
+        'exclude_bots': args.exclude_bots,
+    }
+
+    for r in repo_results:
+        r.pop('_source_file', None)
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    with open(args.output, 'w') as f:
+        json.dump(aggregate, f, indent=2)
+    logger.info("Analysis written to %s", args.output)
+
+    all_no_jira = []
+    for r in repo_results:
+        all_no_jira.extend(r['no_jira_prs'])
+
+    with open(args.save_no_jira, 'w') as f:
+        json.dump(all_no_jira, f, indent=2)
+    logger.info("No-Jira PRs (%d) written to %s", len(all_no_jira), args.save_no_jira)
+
+    print(f"\n{'='*60}")
+    print(f"  Org-wide Jira Compliance Summary")
+    print(f"{'='*60}")
+    print(f"  Total PRs analyzed:  {aggregate['org_summary']['total_prs']:,}")
+    print(f"  With Jira ticket:    {aggregate['org_summary']['with_jira']:,} "
+          f"({aggregate['org_summary']['compliance_rate']*100:.1f}%)")
+    print(f"  Without Jira ticket: {aggregate['org_summary']['without_jira']:,}")
+    print(f"  Bot PRs:             {aggregate['org_summary']['bot_prs']:,}")
+    print(f"  Compliance (excl bots): {aggregate['org_summary']['compliance_rate_excl_bots']*100:.1f}%")
+    print(f"  Repos analyzed:      {aggregate['org_summary']['repos_with_prs']}")
+    print(f"{'='*60}")
+
+
+if __name__ == '__main__':
+    main()

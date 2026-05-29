@@ -1,0 +1,17 @@
+# instill — managed symlinks, do not commit
+.claude/skills/
+.agents/skills/
+.claude/settings.local.json
+
+# Fetched data (large, regenerable)
+data/raw/
+data/fetch_state.json
+
+# Analysis outputs (regenerable)
+data/analysis.json
+data/no_jira.json
+output/
+
+# Python
+__pycache__/
+*.pyc
