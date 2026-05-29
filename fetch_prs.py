@@ -5,6 +5,8 @@ import argparse
 import json
 import logging
 import os
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -153,6 +155,105 @@ def load_fetch_state(state_file: Path) -> dict:
 def save_fetch_state(state_file: Path, state: dict):
     with open(state_file, 'w') as f:
         json.dump(state, f, indent=2)
+
+
+@dataclass
+class FetchConfig:
+    org: str = "StackEng"
+    repos: list[str] | None = None
+    exclude_repos: list[str] = field(default_factory=list)
+    exclude_archived: bool = True
+    since: str | None = None
+    until: str | None = None
+    output_dir: Path = field(default_factory=lambda: Path(__file__).parent / "data" / "raw")
+    resume: bool = True
+    rate_limit_buffer: int = 500
+    max_repos: int | None = None
+    verbose: bool = False
+
+
+@dataclass
+class FetchResult:
+    repos_fetched: int = 0
+    total_prs: int = 0
+    elapsed: float = 0.0
+    errors: list[str] = field(default_factory=list)
+
+
+def run_fetch(
+    config: FetchConfig,
+    on_progress: Callable[[int, int, str], None] | None = None,
+) -> FetchResult:
+    """Run the fetch pipeline programmatically.
+
+    on_progress(current, total, label) called after each repo completes.
+    """
+    import time
+
+    start = time.time()
+    result = FetchResult()
+
+    if config.verbose:
+        logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    state_file = config.output_dir.parent / "fetch_state.json"
+    client = GitHubGraphQLClient(rate_limit_buffer=config.rate_limit_buffer)
+
+    state = load_fetch_state(state_file) if config.resume else {"completed_repos": [], "started_at": None}
+    if not state["started_at"]:
+        state["started_at"] = datetime.now(timezone.utc).isoformat()
+
+    since = config.since
+    if since is None:
+        since = (datetime.now(timezone.utc) - timedelta(days=180)).strftime("%Y-%m-%d")
+
+    if config.repos:
+        repos = [{"name": r, "isArchived": False, "mergedPrCount": -1} for r in config.repos]
+    else:
+        repos = discover_repos(client, config.org, config.exclude_archived, config.exclude_repos)
+
+    repos_manifest = config.output_dir.parent / "repos.json"
+    with open(repos_manifest, "w") as f:
+        json.dump(repos, f, indent=2)
+
+    if config.max_repos:
+        repos = repos[: config.max_repos]
+
+    completed_set = set(state["completed_repos"])
+    total_repos = len(repos)
+
+    for i, repo in enumerate(repos, 1):
+        repo_name = repo["name"]
+        if repo_name in completed_set:
+            if on_progress:
+                on_progress(i, total_repos, repo_name)
+            continue
+
+        try:
+            prs = fetch_prs_for_repo(client, config.org, repo_name, since, config.until)
+        except (GraphQLError, Exception) as e:
+            result.errors.append(f"{repo_name}: {e}")
+            if on_progress:
+                on_progress(i, total_repos, repo_name)
+            continue
+
+        if prs:
+            output_file = config.output_dir / f"{repo_name}.jsonl"
+            with open(output_file, "w") as f:
+                for pr in prs:
+                    f.write(json.dumps(pr) + "\n")
+
+        result.total_prs += len(prs)
+        result.repos_fetched += 1
+        state["completed_repos"].append(repo_name)
+        save_fetch_state(state_file, state)
+
+        if on_progress:
+            on_progress(i, total_repos, repo_name)
+
+    result.elapsed = time.time() - start
+    return result
 
 
 def parse_args() -> argparse.Namespace:

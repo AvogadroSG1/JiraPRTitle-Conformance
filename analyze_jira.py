@@ -5,6 +5,8 @@ import argparse
 import json
 import logging
 from collections import Counter
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -192,6 +194,91 @@ def aggregate_results(repo_results: list[dict]) -> dict:
         'category_breakdown': dict(org_categories.most_common()),
         'per_repo': per_repo_summary,
     }
+
+
+@dataclass
+class AnalyzeConfig:
+    input_dir: Path = field(default_factory=lambda: Path(__file__).parent / "data" / "raw")
+    output: Path = field(default_factory=lambda: Path(__file__).parent / "data" / "analysis.json")
+    since: str | None = None
+    until: str | None = None
+    repos: list[str] | None = None
+    exclude_bots: bool = True
+    save_no_jira: Path = field(default_factory=lambda: Path(__file__).parent / "data" / "no_jira.json")
+    verbose: bool = False
+
+
+@dataclass
+class AnalyzeResult:
+    repos_analyzed: int = 0
+    total_prs: int = 0
+    compliance_rate: float = 0.0
+    elapsed: float = 0.0
+    errors: list[str] = field(default_factory=list)
+
+
+def run_analysis(
+    config: AnalyzeConfig,
+    on_progress: Callable[[int, int, str], None] | None = None,
+) -> AnalyzeResult:
+    """Run analysis programmatically.
+
+    on_progress(current, total, label) called after each repo file is processed.
+    """
+    import time
+
+    start = time.time()
+    result = AnalyzeResult()
+
+    jsonl_files = sorted(config.input_dir.glob("*.jsonl"))
+    if config.repos:
+        repo_set = {r.lower() for r in config.repos}
+        jsonl_files = [f for f in jsonl_files if f.stem.lower() in repo_set]
+
+    if not jsonl_files:
+        result.errors.append(f"No JSONL files found in {config.input_dir}")
+        return result
+
+    total_files = len(jsonl_files)
+    repo_results = []
+
+    for i, repo_file in enumerate(jsonl_files, 1):
+        repo_result = analyze_repo(repo_file, config.since, config.until)
+        repo_result["_source_file"] = str(repo_file)
+        repo_results.append(repo_result)
+
+        if on_progress:
+            on_progress(i, total_files, repo_file.stem)
+
+    quarterly_trends = compute_quarterly_trends(repo_results)
+    aggregate = aggregate_results(repo_results)
+    aggregate["quarterly_trends"] = quarterly_trends
+    aggregate["generated_at"] = datetime.now(timezone.utc).isoformat()
+    aggregate["config"] = {
+        "since": config.since,
+        "until": config.until,
+        "exclude_bots": config.exclude_bots,
+    }
+
+    for r in repo_results:
+        r.pop("_source_file", None)
+
+    config.output.parent.mkdir(parents=True, exist_ok=True)
+    with open(config.output, "w") as f:
+        json.dump(aggregate, f, indent=2)
+
+    all_no_jira = []
+    for r in repo_results:
+        all_no_jira.extend(r["no_jira_prs"])
+
+    with open(config.save_no_jira, "w") as f:
+        json.dump(all_no_jira, f, indent=2)
+
+    result.repos_analyzed = len(repo_results)
+    result.total_prs = aggregate["org_summary"]["total_prs"]
+    result.compliance_rate = aggregate["org_summary"]["compliance_rate"]
+    result.elapsed = time.time() - start
+    return result
 
 
 def parse_args() -> argparse.Namespace:

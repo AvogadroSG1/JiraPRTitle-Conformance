@@ -4,6 +4,8 @@
 import argparse
 import json
 import logging
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -185,6 +187,112 @@ def render_largest_repos(repos: list[dict], top_n: int) -> str:
         )
 
     return '\n'.join(lines)
+
+
+REPORT_SECTIONS = [
+    ("header", None),
+    ("executive_summary", render_executive_summary),
+    ("quarterly_trends", render_quarterly_trends),
+    ("largest_repos", render_largest_repos),
+    ("repo_rankings", render_repo_rankings),
+    ("category_breakdown", render_category_breakdown),
+    ("jira_projects", render_jira_projects),
+    ("recommendations", render_recommendations),
+]
+
+
+@dataclass
+class ReportConfig:
+    input: Path = field(default_factory=lambda: Path(__file__).parent / "data" / "analysis.json")
+    output: Path = field(default_factory=lambda: Path(__file__).parent / "output" / "report.md")
+    format: str = "both"
+    top_n: int = 20
+    min_prs: int = 10
+    verbose: bool = False
+
+
+@dataclass
+class ReportResult:
+    output_files: list[Path] = field(default_factory=list)
+    elapsed: float = 0.0
+    errors: list[str] = field(default_factory=list)
+
+
+def run_report(
+    config: ReportConfig,
+    on_progress: Callable[[int, int, str], None] | None = None,
+) -> ReportResult:
+    """Run report generation programmatically.
+
+    on_progress(current, total, section_name) called after each section renders.
+    """
+    import time
+
+    start = time.time()
+    result = ReportResult()
+
+    if not config.input.exists():
+        result.errors.append(f"Analysis file not found: {config.input}")
+        return result
+
+    with open(config.input) as f:
+        data = json.load(f)
+
+    generated = data.get("generated_at", "unknown")
+    total_sections = len(REPORT_SECTIONS)
+
+    sections = []
+    for i, (name, render_fn) in enumerate(REPORT_SECTIONS, 1):
+        if name == "header":
+            section = (
+                f"# Jira Ticket Compliance Report — StackEng\n\n"
+                f"**Generated:** {generated[:10]} | "
+                f"**Period:** {data.get('config', {}).get('since', 'all time')} to "
+                f"{data.get('config', {}).get('until', 'present')}\n"
+            )
+        elif name == "quarterly_trends":
+            section = render_fn(data.get("quarterly_trends", {}))
+        elif name == "largest_repos":
+            section = render_fn(data.get("per_repo", []), config.top_n)
+        elif name == "repo_rankings":
+            section = render_fn(data.get("per_repo", []), config.top_n, config.min_prs)
+        elif name == "category_breakdown":
+            section = render_fn(data.get("category_breakdown", {}))
+        elif name == "jira_projects":
+            section = render_fn(data.get("jira_projects", {}))
+        else:
+            section = render_fn(data)
+
+        if section:
+            sections.append(section)
+
+        if on_progress:
+            on_progress(i, total_sections, name)
+
+    report_md = "\n\n---\n\n".join(sections)
+    config.output.parent.mkdir(parents=True, exist_ok=True)
+
+    if config.format in ("markdown", "both"):
+        with open(config.output, "w") as f:
+            f.write(report_md)
+        result.output_files.append(config.output)
+
+    if config.format in ("json", "both"):
+        json_output = config.output.with_suffix(".json")
+        summary = {
+            "generated_at": generated,
+            "org_summary": data["org_summary"],
+            "quarterly_trends": data.get("quarterly_trends", {}),
+            "top_repos": data.get("per_repo", [])[:config.top_n],
+            "category_breakdown": data.get("category_breakdown", {}),
+            "jira_projects": dict(list(data.get("jira_projects", {}).items())[:20]),
+        }
+        with open(json_output, "w") as f:
+            json.dump(summary, f, indent=2)
+        result.output_files.append(json_output)
+
+    result.elapsed = time.time() - start
+    return result
 
 
 def parse_args() -> argparse.Namespace:
