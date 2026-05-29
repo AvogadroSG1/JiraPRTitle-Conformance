@@ -27,10 +27,10 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
-  python run.py                         Full pipeline with defaults
-  python run.py --skip-fetch            Reuse existing data, re-analyze and report
-  python run.py --only report           Only regenerate the report
-  python run.py --since 2025-01-01      Custom date range
+  jira-scan                         Full pipeline with defaults
+  jira-scan --skip-fetch            Reuse existing data, re-analyze and report
+  jira-scan --only report           Only regenerate the report
+  jira-scan --since 2025-01-01      Custom date range
 """,
     )
 
