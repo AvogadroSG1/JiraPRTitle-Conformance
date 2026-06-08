@@ -1,0 +1,30 @@
+{
+  "skills": [
+    "ai-workflow/claude-code",
+    "ai-workflow/claude-md-architect",
+    "ai-workflow/grill-me",
+    "ai-workflow/grill-with-docs",
+    "ai-workflow/tdd",
+    "ai-workflow/to-issues",
+    "data/data-storytelling",
+    "productivity/markdown-to-pdf-with-diagrams",
+    "productivity/mermaid",
+    "python/python-configuration",
+    "python/python-design-patterns",
+    "python/python-pro",
+    "python/python-resilience",
+    "python/python-type-safety",
+    "superpowers/brainstorming",
+    "superpowers/dispatching-parallel-agents",
+    "superpowers/executing-plans",
+    "superpowers/finishing-a-development-branch",
+    "superpowers/receiving-code-review",
+    "superpowers/requesting-code-review",
+    "superpowers/subagent-driven-development",
+    "superpowers/systematic-debugging",
+    "superpowers/using-git-worktrees",
+    "superpowers/using-superpowers",
+    "superpowers/verification-before-completion",
+    "superpowers/writing-plans"
+  ]
+}

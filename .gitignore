@@ -8,8 +8,7 @@ data/raw/
 data/fetch_state.json
 
 # Analysis outputs (regenerable)
-data/analysis.json
-data/no_jira.json
+data/
 output/
 
 # Python
